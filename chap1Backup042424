@@ -1,0 +1,1884 @@
+
+```{r Libraries & Data}
+library(dplyr)
+library(purrr) # can we do without?
+library(readxl)
+library(tidyverse)
+library(car)
+infestationData <- read_xlsx("C:\\Users\\lochl\\OneDrive - Montana State University\\Documents\\SawflyResearch\\Analysis\\ProximalSensing2023\\ProximalInfestationData2023.xlsx")
+
+refs <- read.csv2(file = "C:\\Users\\lochl\\OneDrive - Montana State University\\Documents\\SawflyResearch\\Analysis\\ProximalSensing2023\\IBRA\\ReflectanceData23.csv", header = T, sep = "," )
+names(refs)[2:2152] <- c(350:2500)
+refs[2:2152] <- lapply(refs[2:2152],as.numeric)
+
+# filter out wavelengths below 520 nm & above 1870 nm.
+
+# pivot long first
+refsLong <- refs %>% select(c(`520`:`1870`,DAI,sampleName,plantName)) %>%
+  pivot_longer(-c(DAI,sampleName,plantName),
+               names_to = "wavelength",
+               values_to = "reflectance")
+refsLong$wavelength <- as.numeric(refsLong$wavelength) # convert to numeric mostly for plotting
+
+# pivot back to wide
+refsWide <- refsLong %>%
+  pivot_wider(names_from = wavelength,
+              values_from = reflectance,
+              id_cols = c(sampleName,DAI))
+
+# ggplot(refsLong, aes(x = wavelength, y = reflectance, group = DAI, color = DAI)) +
+#   geom_line(stat = "summary", fun.y = "mean") +
+#   labs(x = "Wavelength", y = "Mean Reflectance", color = "DAI") +
+#   ggtitle("Mean Reflectance Over Wavelength by DAI")
+
+
+```
+
+```{r Permutation List}
+#
+# Raw Reflectance
+# Each time point all samples * theta(5,8,12)
+# Time integrated all samples * theta(5,8,12)
+#
+# Other things to do
+# recheck that the dynamic IBRA is working correctly
+#   Define file naming convention
+#     # naming convention = (Static|Dynamic + Reflectance type + DAI + sample treatment + theta).csv
+```
+
+```{r Define IBRA Static}
+IBRA_Static <- function(spectral_matrix, threshold) {
+  if (!is.numeric(spectral_matrix)) {
+    stop("Input matrix must be numeric.")
+  }
+
+  # Function to calculate VIF between two vectors
+  vifPair <- function(x, y) {
+    model <- lm(x ~ y)
+    rsquared <- summary(model)$r.squared
+    vif <- 1 / (1 - rsquared)
+    return(vif)
+  }
+
+  n <- ncol(spectral_matrix)
+  vif_matrix <- matrix(NA, nrow = n, ncol = n)
+  distances_left <- rep(0, n)
+  distances_right <- rep(0, n)
+
+  for (i in 1:n) {
+    for (j in 1:n) {
+      if (i != j) {
+        # Fit linear model
+        model <- lm(spectral_matrix[, i] ~ spectral_matrix[, j])
+        rsq <- summary(model)$r.squared
+        vif <- 1 / (1 - rsq)
+        vif_matrix[i, j] <- vif
+      } else {
+        vif_matrix[i, j] <- NA  # Set diagonal elements to NA
+      }
+    }
+  }
+
+  for (band in 1:ncol(vif_matrix)) {
+    # Check left
+    d_left <- 1  # Set initial distance
+    vifVal_left <- Inf
+    while (vifVal_left > threshold && (band - d_left) > 0) {
+      if (vif_matrix[band, band - d_left] == 0) {
+        vif_matrix[band, band - d_left] <- vifPair(vif_matrix[, band], vif_matrix[, band - d_left])
+        vif_matrix[band - d_left, band] <- vif_matrix[band, band - d_left]
+      }
+      vifVal_left <- vif_matrix[band, band - d_left]
+      d_left <- d_left + 1
+    }
+    distances_left[band] <- d_left - 1
+
+    # Check right
+    d_right <- 1  # Set initial distance
+    vifVal_right <- Inf
+    while (vifVal_right > threshold && (band + d_right) <= ncol(vif_matrix)) {
+      if (vif_matrix[band, band + d_right] == 0) {
+        vif_matrix[band, band + d_right] <- vifPair(vif_matrix[, band], vif_matrix[, band + d_right])
+        vif_matrix[band + d_right, band] <- vif_matrix[band, band + d_right]
+      }
+      vifVal_right <- vif_matrix[band, band + d_right]
+      d_right <- d_right + 1
+    }
+    distances_right[band] <- d_right - 1
+  }
+
+  return(list(vif_matrix = vif_matrix, clusters = abs(distances_left - distances_right)))
+}
+```
+
+```{r Define IBRA Dynamic}
+calcVIFsDynamic <- function(spectral_matrix, time_column) {
+  if (!is.matrix(spectral_matrix)) {
+    stop("Input must be a matrix.")
+  }
+
+  n <- ncol(spectral_matrix)
+  time_points <- unique(spectral_matrix[, time_column])  # Extract unique time points
+  vif_list <- vector("list", length(time_points))  # Initialize a list to store VIF matrices for each time point
+
+  for (k in 1:length(time_points)) {  # Loop through each unique time point
+    current_time_point <- time_points[k]
+    samples_at_time_point <- spectral_matrix[spectral_matrix[, time_column] == current_time_point, -time_column]  # Exclude time column
+    m <- nrow(samples_at_time_point)
+    p <- ncol(samples_at_time_point)
+    vif_matrix <- matrix(NA, nrow = p, ncol = p)  # Initialize VIF matrix for this time point
+
+    for (i in 1:p) {
+      for (j in 1:p) {
+        if (i != j) {
+          # Fit linear model
+          model <- lm(samples_at_time_point[, i] ~ samples_at_time_point[, j])
+          rsq <- summary(model)$r.squared
+          vif <- 1 / (1 - rsq)
+          vif_matrix[i, j] <- vif
+        } else {
+          vif_matrix[i, j] <- NA  # Set diagonal elements to NA
+        }
+      }
+    }
+
+    vif_list[[k]] <- vif_matrix  # Store VIF matrix for this time point in the list
+  }
+
+  return(vif_list)
+}
+
+vifPair <- function(x, y) {
+  model <- lm(x ~ y)
+  rsquared <- summary(model)$r.squared
+  vif <- 1 / (1 - rsquared)
+  return(vif)
+}
+
+clustersDynamic <- function(vif_matrices, threshold) {
+  n_bands <- ncol(vif_matrices[[1]])
+  n_times <- length(vif_matrices)
+  cluster_distances <- array(0, dim = c(n_bands, n_times))  # Initialize cluster_distances array
+
+  for (time_point in 1:n_times) {
+    vif_matrix <- vif_matrices[[time_point]]  # Get VIF matrix for the current time point
+
+    # Check within the same time point
+    for (band in 1:n_bands) {
+      distances_within <- rep(0, n_bands)
+
+      # Check left
+      d <- 1  # Set initial distance
+      vifVal <- Inf
+      while (vifVal > threshold && (band - d) > 0) {
+        if (vif_matrix[band, band - d] == 0) {
+          vif_matrix[band, band - d] <- vifPair(vif_matrix[, band], vif_matrix[, band - d])
+          vif_matrix[band - d, band] <- vif_matrix[band, band - d]
+        }
+        vifVal <- vif_matrix[band, band - d]
+        d <- d + 1
+      }
+      distances_within[band] <- d - 1
+
+      # Check right
+      d <- 1  # Set initial distance
+      vifVal <- Inf
+      while (vifVal > threshold && (band + d) <= n_bands) {
+        if (vif_matrix[band, band + d] == 0) {
+          vif_matrix[band, band + d] <- vifPair(vif_matrix[, band], vif_matrix[, band + d])
+          vif_matrix[band + d, band] <- vif_matrix[band, band + d]
+        }
+        vifVal <- vif_matrix[band, band + d]
+        d <- d + 1
+      }
+      distances_within[band] <- distances_within[band] + (d - 1)
+
+      # Update cluster_distances array
+      cluster_distances[band, time_point] <- cluster_distances[band, time_point] + abs(distances_within[band])
+    }
+
+    # Check forward across time
+    if (time_point < n_times) {
+      next_vif_matrix <- vif_matrices[[time_point + 1]]
+      for (band in 1:n_bands) {
+        distances_forward <- rep(0, n_bands)
+
+        # Check forward
+        d <- 1  # Set initial distance
+        vifVal <- Inf
+        while (vifVal > threshold && (band + d) <= n_bands) {
+          if (next_vif_matrix[band, band + d] == 0) {
+            next_vif_matrix[band, band + d] <- vifPair(vif_matrix[, band], next_vif_matrix[, band + d])
+            next_vif_matrix[band + d, band] <- next_vif_matrix[band, band + d]
+          }
+          vifVal <- next_vif_matrix[band, band + d]
+          d <- d + 1
+        }
+        distances_forward[band] <- d - 1
+
+        # Update cluster_distances array
+        cluster_distances[band, time_point] <- cluster_distances[band, time_point] + abs(distances_forward[band])
+      }
+    }
+
+    # Check backward across time
+    if (time_point > 1) {
+      prev_vif_matrix <- vif_matrices[[time_point - 1]]
+      for (band in 1:n_bands) {
+        distances_backward <- rep(0, n_bands)
+
+        # Check backward
+        d <- 1  # Set initial distance
+        vifVal <- Inf
+        while (vifVal > threshold && (band - d) > 0) {
+          if (prev_vif_matrix[band, band - d] == 0) {
+            prev_vif_matrix[band, band - d] <- vifPair(vif_matrix[, band], prev_vif_matrix[, band - d])
+            prev_vif_matrix[band - d, band] <- prev_vif_matrix[band, band - d]
+          }
+          vifVal <- prev_vif_matrix[band, band - d]
+          d <- d + 1
+        }
+        distances_backward[band] <- d - 1
+
+        # Update cluster_distances array
+        cluster_distances[band, time_point] <- cluster_distances[band, time_point] + abs(distances_backward[band])
+      }
+    }
+  }
+
+  return(cluster_distances)
+}
+```
+
+```{r IBRA Dynamic Consolidation Test}
+DynamicSpec <- refsWide %>%
+  dplyr::select(DAI, `520`:`1870`) %>%
+  as.matrix(.)
+
+
+IBRA_Dynamic <- function(spectral_matrix, time_column, threshold) {
+  if (!is.matrix(spectral_matrix)) {
+    stop("Input must be a matrix.")
+  }
+
+  # Function to calculate VIF between two vectors
+  vifPair <- function(x, y) {
+    model <- lm(x ~ y)
+    rsquared <- summary(model)$r.squared
+    vif <- 1 / (1 - rsquared)
+    return(vif)
+  }
+
+  n <- ncol(spectral_matrix)
+  time_points <- unique(spectral_matrix[, time_column])
+  n_times <- length(time_points)
+  vif_list <- vector("list", length = n_times)
+  cluster_distances <- array(0, dim = c(n, n_times))
+
+  for (k in 1:n_times) {
+    current_time_point <- time_points[k]
+    samples_at_time_point <- spectral_matrix[spectral_matrix[, time_column] == current_time_point, -time_column]
+    m <- nrow(samples_at_time_point)
+    p <- ncol(samples_at_time_point)
+    vif_matrix <- matrix(NA, nrow = p, ncol = p)
+
+    for (i in 1:p) {
+      for (j in 1:p) {
+        if (i != j) {
+          # Fit linear model
+          model <- lm(samples_at_time_point[, i] ~ samples_at_time_point[, j])
+          rsq <- summary(model)$r.squared
+          vif <- 1 / (1 - rsq)
+          vif_matrix[i, j] <- vif
+        } else {
+          vif_matrix[i, j] <- NA  # Set diagonal elements to NA
+        }
+      }
+    }
+
+    vif_list[[k]] <- vif_matrix
+
+    for (band in 1:ncol(vif_matrix)) {
+      distances_within <- rep(0, n)
+
+      # Check left
+      d_left <- 1
+      vifVal_left <- Inf
+      while (vifVal_left > threshold && (band - d_left) > 0) {
+        if (vif_matrix[band, band - d_left] == 0) {
+          vif_matrix[band, band - d_left] <- vifPair(vif_matrix[, band], vif_matrix[, band - d_left])
+          vif_matrix[band - d_left, band] <- vif_matrix[band, band - d_left]
+        }
+        vifVal_left <- vif_matrix[band, band - d_left]
+        d_left <- d_left + 1
+      }
+      distances_within[band] <- d_left - 1
+
+      # Check right
+      d_right <- 1
+      vifVal_right <- Inf
+      while (vifVal_right > threshold && (band + d_right) <= ncol(vif_matrix)) {
+        if (vif_matrix[band, band + d_right] == 0) {
+          vif_matrix[band, band + d_right] <- vifPair(vif_matrix[, band], vif_matrix[, band + d_right])
+          vif_matrix[band + d_right, band] <- vif_matrix[band, band + d_right]
+        }
+        vifVal_right <- vif_matrix[band, band + d_right]
+        d_right <- d_right + 1
+      }
+      distances_within[band] <- distances_within[band] + (d_right - 1)
+
+      cluster_distances[band, k] <- cluster_distances[band, k] + abs(distances_within[band])
+    }
+  }
+
+  return(list(vif_matrices = vif_list, cluster_distances = cluster_distances))
+}
+
+IBRADynamicT <- IBRA_Dynamic(DynamicSpec, time_column = 1, threshold = 8)
+
+matplot(t(DynamicSpec %>%
+  as.data.frame() %>%
+  group_by(DAI) %>%
+  summarize(across(everything(),list(mean))) %>%
+  setNames(c("DAI",c(600:950))) %>%
+  ungroup() %>%
+  dplyr::select(-DAI)), type = "l", ylab = "Reflectance")
+
+matplot(IBRADynamicT$cluster_distances, type = "l", ylab = "VIF")
+
+
+```
+
+```{r IBRA Static - Dummy Spec Run Through}
+waves <- 600:950
+
+refsT14 <- refs %>%
+  filter(DAI == 14) %>%
+  dplyr::select(`600`:`950`) %>%
+  as.matrix(.)
+
+refsT56 <- refs %>%
+  filter(DAI == 56) %>%
+  dplyr::select(`600`:`950`) %>%
+  as.matrix(.)
+
+
+IBRAStaticT14 <- IBRA_Static(refsT14, threshold = 8)
+IBRAStaticT56 <- IBRA_Static(refsT56, threshold = 8)
+
+nonRedundantWaves <- {as.data.frame(rbind(IBRAStaticT14$clusters,IBRAStaticT56$clusters), row.names = c("DAI14","DAI56")) %>%
+  setNames(as.character(600:950)) %>%
+  mutate(DAI = c(14,56)) %>%
+  pivot_longer(-DAI,
+               names_to = "wavelength",
+               values_to = "VIF") %>%
+  group_by(DAI) %>%
+  filter(VIF  < 5)}
+
+refsLong <- refs %>% select(c(`600`:`950`,DAI,sampleName)) %>%
+  pivot_longer(-c(DAI,sampleName),
+               names_to = "wavelength",
+               values_to = "reflectance")
+
+selectedWavesWide <- nonRedundantWaves %>%
+  inner_join(refsLong, by  = c("DAI","wavelength")) %>%
+  pivot_wider(names_from = wavelength,
+              values_from = reflectance,
+              values_fill = 1,
+              id_cols = c(sampleName,DAI))
+
+selectedWavesLong <- selectedWavesWide %>%
+  pivot_longer(-c(DAI,sampleName),
+                  names_to = "wavelength",
+                  values_to = "reflectance")
+
+#contains magic numbers & consolidate
+dummySpec <- as.data.frame(matrix(nrow = nrow(selectedWavesWide), ncol = length(600:950)))
+dummySpec <- data.frame(lapply(dummySpec,as.numeric)) %>%
+  setNames(600:950) %>%
+  mutate(sampleName = selectedWavesWide$sampleName)
+# pivot longer
+dummySpecLong <- dummySpec %>%
+  pivot_longer(-sampleName,
+               names_to = "wavelength",
+               values_to = "reflectance")
+dummySpecLong$reflectance <- 1 # dummy reflectance
+
+# remove matches from "selectWavesLong"
+dummySpecLong <- dummySpecLong %>%
+filter(!wavelength %in% c(unique(selectedWavesLong$wavelength)))
+
+nonRedundantSpec <- dummySpecLong  %>%
+  bind_rows(selectedWavesLong) %>%
+  pivot_wider(names_from = wavelength,
+              names_sort = T,
+              values_from = reflectance,
+              id_cols = c(sampleName))
+
+dummySpecIBRA <- IBRA_Static(as.matrix(nonRedundantSpec[-1]), threshold = 8)
+
+# replace cluster values from wavelengths only found in dummy spec with a very high VIF value
+names(dummySpecIBRA$clusters) <- 600:950 # consolidate into IBRA call
+cumulativeIBRA_VIFs <- as.data.frame(dummySpecIBRA$clusters) %>%
+  rownames_to_column() %>% setNames(c("wavelength","VIF")) %>%
+  filter(wavelength %in% selectedWavesLong$wavelength)
+# cumulativeIBRA_VIFs$VIF <- as.character(cumulativeIBRA_VIFs$VIF)  # consolidate with previous line
+# add dummy waves back with psuedo VIFs
+
+# Create dummy VIFs
+dummyVifs <- as.data.frame(cbind(wavelength = as.character(c(600:950)), VIF = rep(max(as.numeric(cumulativeIBRA_VIFs$VIF)), times = length(600:950)))) %>%
+  filter(!wavelength %in% selectedWavesLong$wavelength)
+dummyVifs$VIF <- as.numeric(dummyVifs$VIF)
+
+cumulativeVIFs <- dummyVifs %>%
+  bind_rows(cumulativeIBRA_VIFs)
+# extract local minima
+
+plot(cumulativeVIFs$wavelength,cumulativeVIFs$VIF)
+
+# ****check for Identical wavelengths across time within NR waves?
+
+matplot(t(refsT56 %>%
+  as.data.frame() %>%
+  summarize(across(everything(),list(mean))) %>%
+  setNames(c(600:950))), type = "l", ylab = "Reflectance")
+
+matplot(dummySpecIBRA$clusters, type = "l", ylab = "VIF", ylim = c(0,5))
+
+table(dummySpecIBRA$clusters)
+```
+
+```{r Identify cut off points for noisy spectra}
+refsT <- refs %>%
+  filter(DAI == 14) %>%
+  dplyr::select(`350`:`2500`) %>%
+  as.matrix(.)
+
+IBRAStatic14 <- IBRA_Static(refsT, threshold = 8)
+
+refsTMu <- refsT %>%
+  as.data.frame(.) %>%
+  summarize(across(everything(),list(mean))) %>%
+  setNames(350:2500)
+
+IBRAStatic14$reflectance <- unlist(refsTMu)
+IBRAStatic14$wavelength <- 350:2500
+mat <- as.data.frame(IBRAStatic14[-1])
+
+plotly::ggplotly(ggplot(mat, aes(x=wavelength)) +
+  geom_line(aes(y=(reflectance)*1100)) +
+  geom_line(aes(y=mat$clusters)) + scale_y_continuous(
+    name = "VIF", limits = c(0,420),
+    sec.axis = sec_axis(~./1000, name="Reflectance"))  + geom_line(
+    mapping = aes(y = reflectance*1100),
+    data = mat, colour = 'darkgreen',
+    size = 1.25) + geom_vline(xintercept = 1775, col = "dark red") + ggtitle("IBRA VIF Values Across Control Spectra"))
+
+plotly::ggplotly(ggplot(mat, aes(x = wavelength, y = clusters)) + geom_line())
+
+plot <- plotly::plot_ly(data = mat, x = ~as.numeric(wavelength), y = ~clusters, type = 'scatter', mode = 'lines')
+
+# Customize the plot layout
+plot <- plot %>% layout(
+  title = "Your Plot Title",
+  xaxis = list(title = "Wavelength"),
+  yaxis = list(title = "Clusters")
+)
+print(plot)
+
+par(mfrow = c(1,2))
+plot(mat$wavelength,mat$clusters, type = "l", xlab = "Wavelength nm", ylab = "VIF", main = "IBRA")
+abline(v = 520, col = "red")
+abline(v = 1870, col = "red")
+plot(mat$wavelength,mat$reflectance, type = "l", col = "green", ylim = c(0.04,.4),xlab = "Wavelength nm", ylab = "reflectance", main = "Mean Reflectance")
+abline(v = 520, col = "red")
+abline(v = 1870, col = "red")
+
+```
+
+Static, Original Reflectance, DAI 0, theta = 5
+```{r}
+# refsT <- refs %>%
+#   filter(DAI == 0) %>%
+#   dplyr::select(`520`:`1870`) %>%
+#   as.matrix(.)
+#
+# startT <- Sys.time()
+# clustersS_OG_0_5 <- IBRA_Static(refsT, threshold = 5)
+
+
+# write_excel_csv(as.data.frame(clustersS_OG_0_5$clusters), "C:\\Users\\lochl\\OneDrive - Montana State University\\Documents\\SawflyResearch\\Analysis\\ProximalSensing2023\\IBRA\\S_OG_0_5.csv")
+
+clustersS_OG_0_5 <- read.csv2("C:\\Users\\lochl\\OneDrive - Montana State University\\Documents\\SawflyResearch\\Analysis\\ProximalSensing2023\\IBRA\\S_OG_0_5.csv", sep = ",",header = T) %>% setNames("VIF")
+
+nrDAI0 <- clustersS_OG_0_5 %>%
+  mutate(wavelength = 520:1870) %>%
+  mutate(DAI = 0) %>%
+  rownames_to_column(var = "rowName") %>%
+  filter(rowName %in% hilbertSimilarity::localMinima(VIF)) %>%
+  filter(VIF < 5)
+```
+
+Static, Original Reflectance, DAI 7, theta = 5
+```{r}
+# refsT <- refs %>%
+#   filter(DAI == 7) %>%
+#   dplyr::select(`520`:`1870`) %>%
+#   as.matrix(.)
+
+# clustersS_OG_7_5 <- IBRA_Static(refsT, threshold = 5)
+
+# write_excel_csv(as.data.frame(clustersS_OG_7_5$clusters), "C:\\Users\\lochl\\OneDrive - Montana State University\\Documents\\SawflyResearch\\Analysis\\ProximalSensing2023\\IBRA\\S_OG_7_5.csv")
+
+clustersS_OG_7_5 <- read.csv2("C:\\Users\\lochl\\OneDrive - Montana State University\\Documents\\SawflyResearch\\Analysis\\ProximalSensing2023\\IBRA\\S_OG_7_5.csv", sep = ",",header = T) %>% setNames("VIF")
+
+nrDAI7 <- clustersS_OG_7_5 %>%
+  mutate(wavelength = 520:1870) %>%
+  mutate(DAI = 7) %>%
+  rownames_to_column(var = "rowName") %>%
+  filter(rowName %in% hilbertSimilarity::localMinima(VIF)) %>%
+  filter(VIF < 5)
+```
+
+Static, Original Reflectance, DAI 14, theta = 5
+```{r}
+# refsT <- refs %>%
+#   filter(DAI == 14) %>%
+#   dplyr::select(`520`:`1870`) %>%
+#   as.matrix(.)
+#
+# clustersS_OG_14_5 <- IBRA_Static(refsT, threshold = 5)
+
+# write_excel_csv(as.data.frame(clustersS_OG_14_5$clusters), "C:\\Users\\lochl\\OneDrive - Montana State University\\Documents\\SawflyResearch\\Analysis\\ProximalSensing2023\\IBRA\\S_OG_14_5.csv")
+
+clustersS_OG_14_5 <- read.csv2("C:\\Users\\lochl\\OneDrive - Montana State University\\Documents\\SawflyResearch\\Analysis\\ProximalSensing2023\\IBRA\\S_OG_14_5.csv", sep = ",",header = T) %>% setNames("VIF")
+
+nrDAI14 <- clustersS_OG_14_5 %>%
+  mutate(wavelength = 520:1870) %>%
+  mutate(DAI = 14) %>%
+  rownames_to_column(var = "rowName") %>%
+  filter(rowName %in% hilbertSimilarity::localMinima(VIF)) %>%
+  filter(VIF < 5)
+
+```
+
+Static, Original Reflectance, DAI 21, theta = 5
+```{r}
+# refsT <- refs %>%
+#   filter(DAI == 21) %>%
+#   dplyr::select(`520`:`1870`) %>%
+#   as.matrix(.)
+#
+# clustersS_OG_21_5 <- IBRA_Static(refsT, threshold = 5)
+
+# write_excel_csv(as.data.frame(clustersS_OG_21_5$clusters), "C:\\Users\\lochl\\OneDrive - Montana State University\\Documents\\SawflyResearch\\Analysis\\ProximalSensing2023\\IBRA\\S_OG_21_5.csv")
+
+clustersS_OG_21_5 <- read.csv2("C:\\Users\\lochl\\OneDrive - Montana State University\\Documents\\SawflyResearch\\Analysis\\ProximalSensing2023\\IBRA\\S_OG_21_5.csv", sep = ",",header = T) %>% setNames("VIF")
+
+nrDAI21 <- clustersS_OG_21_5 %>%
+  mutate(wavelength = 520:1870) %>%
+  mutate(DAI = 21) %>%
+  rownames_to_column(var = "rowName") %>%
+  filter(rowName %in% hilbertSimilarity::localMinima(VIF)) %>%
+  filter(VIF < 5)
+```
+
+Static, Original Reflectance, DAI 28, theta = 5
+```{r}
+# refsT <- refs %>%
+#   filter(DAI == 28) %>%
+#   dplyr::select(`520`:`1870`) %>%
+#   as.matrix(.)
+#
+# clustersS_OG_28_5 <- IBRA_Static(refsT, threshold = 5)
+
+# write_excel_csv(as.data.frame(clustersS_OG_28_5$clusters), "C:\\Users\\lochl\\OneDrive - Montana State University\\Documents\\SawflyResearch\\Analysis\\ProximalSensing2023\\IBRA\\S_OG_28_5.csv")
+
+clustersS_OG_28_5 <- read.csv2("C:\\Users\\lochl\\OneDrive - Montana State University\\Documents\\SawflyResearch\\Analysis\\ProximalSensing2023\\IBRA\\S_OG_28_5.csv", sep = ",",header = T) %>% setNames("VIF")
+
+nrDAI28 <- clustersS_OG_28_5 %>%
+  mutate(wavelength = 520:1870) %>%
+  mutate(DAI = 28) %>%
+  rownames_to_column(var = "rowName") %>%
+  filter(rowName %in% hilbertSimilarity::localMinima(VIF)) %>%
+  filter(VIF < 5)
+```
+
+Static, Original Reflectance, DAI 35, theta = 5
+```{r}
+# refsT <- refs %>%
+#   filter(DAI == 35) %>%
+#   dplyr::select(`520`:`1870`) %>%
+#   as.matrix(.)
+#
+# clustersS_OG_35_5 <- IBRA_Static(refsT, threshold = 5)
+
+# write_excel_csv(as.data.frame(clustersS_OG_35_5$clusters), "C:\\Users\\lochl\\OneDrive - Montana State University\\Documents\\SawflyResearch\\Analysis\\ProximalSensing2023\\IBRA\\S_OG_35_5.csv")
+
+clustersS_OG_35_5 <- read.csv2("C:\\Users\\lochl\\OneDrive - Montana State University\\Documents\\SawflyResearch\\Analysis\\ProximalSensing2023\\IBRA\\S_OG_35_5.csv", sep = ",",header = T) %>% setNames("VIF")
+
+nrDAI35 <- clustersS_OG_35_5 %>%
+  mutate(wavelength = 520:1870) %>%
+  mutate(DAI = 35) %>%
+  rownames_to_column(var = "rowName") %>%
+  filter(rowName %in% hilbertSimilarity::localMinima(VIF)) %>%
+  filter(VIF < 5)
+```
+
+Static, Original Reflectance, DAI 42, theta = 5
+```{r}
+# refsT <- refs %>%
+#   filter(DAI == 42) %>%
+#   dplyr::select(`520`:`1870`) %>%
+#   as.matrix(.)
+#
+# clustersS_OG_42_5 <- IBRA_Static(refsT, threshold = 5)
+
+# write_excel_csv(as.data.frame(clustersS_OG_42_5$clusters), "C:\\Users\\lochl\\OneDrive - Montana State University\\Documents\\SawflyResearch\\Analysis\\ProximalSensing2023\\IBRA\\S_OG_42_5.csv")
+
+clustersS_OG_42_5 <- read.csv2("C:\\Users\\lochl\\OneDrive - Montana State University\\Documents\\SawflyResearch\\Analysis\\ProximalSensing2023\\IBRA\\S_OG_42_5.csv", sep = ",",header = T) %>% setNames("VIF")
+
+nrDAI42 <- clustersS_OG_42_5 %>%
+  mutate(wavelength = 520:1870) %>%
+  mutate(DAI = 42) %>%
+  rownames_to_column(var = "rowName") %>%
+  filter(rowName %in% hilbertSimilarity::localMinima(VIF)) %>%
+  filter(VIF < 5)
+
+```
+
+Static, Original Reflectance, DAI 49, theta = 5
+```{r}
+# refsT <- refs %>%
+#   filter(DAI == 49) %>%
+#   dplyr::select(`520`:`1870`) %>%
+#   as.matrix(.)
+#
+# clustersS_OG_49_5 <- IBRA_Static(refsT, threshold = 5)
+
+# write_excel_csv(as.data.frame(clustersS_OG_49_5$clusters), "C:\\Users\\lochl\\OneDrive - Montana State University\\Documents\\SawflyResearch\\Analysis\\ProximalSensing2023\\IBRA\\S_OG_49_5.csv")
+
+clustersS_OG_49_5 <- read.csv2("C:\\Users\\lochl\\OneDrive - Montana State University\\Documents\\SawflyResearch\\Analysis\\ProximalSensing2023\\IBRA\\S_OG_49_5.csv", sep = ",",header = T) %>% setNames("VIF")
+
+nrDAI49 <- clustersS_OG_49_5 %>%
+  mutate(wavelength = 520:1870) %>%
+  mutate(DAI = 49) %>%
+  rownames_to_column(var = "rowName") %>%
+  filter(rowName %in% hilbertSimilarity::localMinima(VIF)) %>%
+  filter(VIF < 5)
+```
+
+Static, Original Reflectance, DAI 56, theta = 5
+```{r}
+# refsT <- refs %>%
+#   filter(DAI == 56) %>%
+#   dplyr::select(`520`:`1870`) %>%
+#   as.matrix(.)
+
+#
+# clustersS_OG_56_5 <- IBRA_Static(refsT, threshold = 5)
+# endT <- Sys.time()
+#  endT -startT
+
+# write_excel_csv(as.data.frame(clustersS_OG_56_5$clusters), "C:\\Users\\lochl\\OneDrive - Montana State University\\Documents\\SawflyResearch\\Analysis\\ProximalSensing2023\\IBRA\\S_OG_56_5.csv")
+
+clustersS_OG_56_5 <- read.csv2("C:\\Users\\lochl\\OneDrive - Montana State University\\Documents\\SawflyResearch\\Analysis\\ProximalSensing2023\\IBRA\\S_OG_56_5.csv", sep = ",",header = T) %>% setNames("VIF")
+
+
+nrDAI56 <- clustersS_OG_56_5 %>%
+  mutate(wavelength = 520:1870) %>%
+  mutate(DAI = 56) %>%
+  rownames_to_column(var = "rowName") %>%
+  filter(rowName %in% hilbertSimilarity::localMinima(VIF)) %>%
+  filter(VIF < 5)
+```
+
+cumulative spectrum IBRA *taking local minimum prior (using "plantName" not "sampleName")
+*** omit this step ?
+```{r}
+nrCumulative <- as.data.frame(rbind(nrDAI0,
+      nrDAI7,
+      nrDAI14,
+      nrDAI21,
+      nrDAI28,
+      nrDAI35,
+      nrDAI42,
+      nrDAI49,
+      nrDAI56)) %>%
+  select(-rowName)
+
+# identify wavelengths that show up at more than one point in time.
+waveDups <- nrCumulative$wavelength[duplicated(nrCumulative$wavelength)]
+waveDups <- as.data.frame(x = cbind(wavelength = as.integer(waveDups), VIF = as.integer(rep(0, times = length(waveDups)))))
+nrCumulative <- nrCumulative %>%
+filter(!wavelength %in% waveDups$wavelength)
+
+refsLong <- refs %>% select(c(`520`:`1870`,DAI,plantName)) %>%
+  pivot_longer(-c(DAI,plantName),
+               names_to = "wavelength",
+               values_to = "reflectance") %>%
+  mutate(wavelength = as.numeric(wavelength))
+
+selectedWavesWide <- refsLong %>%
+  inner_join(nrCumulative, by = c("DAI","wavelength"))%>%
+  select(-c(DAI,VIF)) %>%
+  group_by(plantName) %>%
+      pivot_wider(names_from = wavelength,
+              values_from = reflectance,
+              values_fill = .75)
+
+# is this one necessary?
+selectedWavesLong <- selectedWavesWide %>%
+  pivot_longer(-c(plantName),
+                  names_to = "wavelength",
+                  values_to = "reflectance")
+
+dummySpec <- as.data.frame(matrix(data = rnorm(n = 100, mean = .75, sd = .01),nrow = nrow(selectedWavesWide), ncol = length(520:1870)))
+dummySpec <- data.frame(lapply(dummySpec,as.numeric)) %>%
+  setNames(520:1870) %>%
+  mutate(plantName = selectedWavesWide$plantName)
+dummySpecLong <- dummySpec %>%
+  pivot_longer(-plantName,
+               names_to = "wavelength",
+               values_to = "reflectance")
+
+# remove matches from "selectWavesLong"
+dummySpecLong <- dummySpecLong %>%
+filter(!wavelength %in% c(unique(selectedWavesLong$wavelength)))
+
+nonRedundantSpec <- dummySpecLong  %>%
+  bind_rows(selectedWavesLong) %>%
+  pivot_wider(names_from = wavelength,
+              names_sort = T,
+              values_from = reflectance,
+              id_cols = c(plantName))
+
+# what is this for?
+# ts <- nonRedundantSpec %>%
+#   pivot_longer(-plantName,
+#                names_to = "wavelength",
+#                values_to = "reflectance")
+# plot(ts$wavelength,ts$reflectance, type = "p")
+
+sortedSpec <- nonRedundantSpec %>% dplyr::select(as.character(c(520:1870)))
+
+# dummySpecIBRA <- suppressWarnings(IBRA_Static(as.matrix(sortedSpec), threshold = 5))
+#
+# write_excel_csv(as.data.frame(dummySpecIBRA$clusters), "C:\\Users\\lochl\\OneDrive - Montana State University\\Documents\\SawflyResearch\\Analysis\\ProximalSensing2023\\IBRA\\compositeIBRA041324ReplicationTest_5.csv")
+
+
+compIBRA1 <- read.csv2("C:\\Users\\lochl\\OneDrive - Montana State University\\Documents\\SawflyResearch\\Analysis\\ProximalSensing2023\\IBRA\\compositeIBRA041324_5.csv", sep = ",") %>%
+  setNames("VIF") %>%
+  mutate(wavelength = 520:1870) %>%
+  filter(VIF < 5 & wavelength %in% nrCumulative$wavelength) %>%
+  bind_rows(waveDups) %>%
+  arrange(wavelength)
+```
+
+Mean Reflectance of Salient Wavelengths over time
+```{r}
+nrCumulative <- as.data.frame(rbind(nrDAI0,
+      nrDAI7,
+      nrDAI14,
+      nrDAI21,
+      nrDAI28,
+      nrDAI35,
+      nrDAI42,
+      nrDAI49,
+      nrDAI56)) %>%
+  select(-rowName)
+
+salientReflectance <- semi_join(refsLong,nrCumulative, by = c("DAI","wavelength"))
+
+# take the mean reflectance for plotting and add NA for missing wavelengths
+meanSalientRef <- salientReflectance %>%
+  group_by(DAI, wavelength) %>%
+  summarize(meanReflectance = mean(reflectance))
+
+# Create dummy reflectance spectrum without waves in meanSalientRef
+dummyRef <- as.data.frame(cbind(wavelength = as.character(c(520:1870)), meanReflectance = rep(NA,times = length(520:1870)))) %>%
+  mutate(wavelength =as.numeric(wavelength)) %>%
+  filter(!wavelength %in% meanSalientRef$wavelength)
+dummyRef$meanReflectance <- as.numeric(dummyRef$meanReflectance)
+
+# mean salient reflectance with redundant waves as NA
+meanSalientRef <- dummyRef %>%
+  bind_rows(meanSalientRef)
+meanSalientRef$wavelength[is.na(meanSalientRef$meanReflectance)] <- NA
+
+ggplot(meanSalientRef,aes(x = as.numeric(wavelength), y = meanReflectance, color = DAI, shape = wavelength)) + scale_color_gradient2(midpoint = 35,low="darkgreen",mid = "green",high = "yellow") + geom_point(shape = "|", size = 4.5) + theme_classic() + xlab("Wavelength (nm)") + ylab("Reflectance") + ggtitle("Mean Reflectance of Salient Wavelengths over Time")
+
+
+
+```
+
+Feature selection with AIC/BIC (*this part negates doing IBRA on final spectrum)
+*how does AIC handle (multi)colinearity?
+```{r}
+nrCumulative <- as.data.frame(rbind(nrDAI0,
+      nrDAI7,
+      nrDAI14,
+      nrDAI21,
+      nrDAI28,
+      nrDAI35,
+      nrDAI42,
+      nrDAI49,
+      nrDAI56)) %>%
+  select(-rowName)
+
+salientReflectance <- semi_join(refsLong,nrCumulative, by = c("DAI","wavelength"))
+
+compositeDataTheta5 <- salientReflectance %>%
+  inner_join(infestationData, by = "plantName") %>%
+  select(plantName,DAI,wavelength,reflectance,percentSigInfested)
+
+CDT5Wide <- compositeDataTheta5 %>%
+  unite("DAI_Wavelength", c("DAI","wavelength"), sep = "_") %>%
+  pivot_wider(names_from = DAI_Wavelength,
+              values_from = reflectance) %>%
+  na.omit() # yikes
+
+# remove plantName for modelling
+CDT5WideARD <- CDT5Wide[,-1] %>% na.omit() # remove NA's b/c modelling will do this anyway
+
+# should we take the log of our target variable
+# logit / probit?
+ hist(CDT5WideARD$percentSigInfested)
+ hist(log(CDT5WideARD$percentSigInfested))
+
+lm1 <- lm(percentSigInfested ~ ., CDT5WideARD)
+# summary(lm1)
+
+# AIC
+# step(lm1,direction= "both", k = 2)
+
+# selected Model
+lmBestAIC <- lm(formula = percentSigInfested ~ `0_613` + `0_704` + `0_707` +
+    `0_1057` + `0_1477` + `0_1481` + `0_1488` + `0_1682` + `7_549` +
+    `7_634` + `7_703` + `7_709` + `7_1404` + `7_1674` + `14_710` +
+    `14_714` + `14_1072` + `14_1667` + `21_618` + `21_721` +
+    `21_1493` + `21_1671` + `28_619` + `28_729` + `28_1062` +
+    `28_1458` + `28_1513` + `28_1693` + `28_1814` + `35_620` +
+    `35_727` + `35_729` + `35_1388` + `42_624` + `42_717` + `42_1051` +
+    `42_1470` + `49_630` + `49_632` + `49_696` + `49_1285`, data = CDT5WideARD)
+summary(lmBestAIC)
+plot(lmBestAIC)
+
+anovaTable1 <- Anova(lmBestAIC)
+sortedAnovaTable1 <- anovaTable1[order(anovaTable1$"Pr(>F)"), ]
+print(sortedAnovaTable1)
+
+plot(lmBestAIC$fitted.values, CDT5WideARD$percentSigInfested, xlab = "Predicted", ylab = "Actual", main = "AIC selected - Fitted to Linear Model, Actual V. Predicted")
+abline(1,1)
+
+library(sjPlot)
+
+plot_model(lmBestAIC, type = "est", show.ci = F)
+
+
+plot(CDT5WideARD$percentSigInfested,CDT5WideARD$`42_1470`)
+
+cor(CDT5WideARD$percentSigInfested,CDT5WideARD$`42_1470`)
+
+# grab 20 most important covariates
+lmAICSigWaves3 <- as.numeric(str_extract(row.names(sortedAnovaTable1[1:3,]), "(?<=_)[0-9]+"))
+
+ThreeWavesARD <- compositeDataTheta5 %>%
+  filter(wavelength %in% lmAICSigWaves3)
+
+
+
+library(lme4)
+library(lmerTest)
+
+# Fit a mixed-effects model
+model <- lmer(reflectance ~ as.factor(wavelength) + percentSigInfested + (1 | DAI) + (1 | plantName), data = TwentyWavesARD)
+
+model2 <- lmer(reflectance ~ percentSigInfested + (DAI*wavelength) + (1 | plantName), data = TwentyWavesARD)
+
+# model2 <- lmer(percentSigInfested ~  reflectance + as.factor(DAI) + (1 | plantName) + (1 | wavelength), data = TwentyWavesARD)
+
+t <- step(model, direction = "both")
+
+# Print the summary of the model
+anova(model2)
+
+# # Conduct ANOVA on the model
+# anova(model)
+# # Normal Q-Q Plot using lattice package
+# lattice::qqmath(~residuals(model) | as.factor(plantName), data = TwentyWavesARD, distribution = qnorm)
+#
+# lattice::xyplot(residuals(model) ~ TwentyWavesARD$wavelength*TwentyWavesARD$percentSigInfested*TwentyWavesARD$DAI, type = c("p", "smooth"), xlab = "Predictor Variable", ylab = "Residuals")
+
+predictmeans::residplot(model2, newwd = F)
+##########33
+library(MANOVA.RM)
+
+
+wavesARD <- refsLong %>%
+  inner_join(infestationData, by = "plantName") %>%
+  select(plantName,DAI,wavelength,reflectance,percentSigInfested,rep) %>%
+  filter(rep != "K") %>%
+  filter(wavelength %in% lmAICSigWaves3)
+
+wavesARDWide <- wavesARD %>%
+  pivot_wider(names_from = wavelength,
+              values_from = reflectance,
+              values_fill = NA)
+
+# id plantNames that have a missing DC Event
+n_distDAI <- wavesARDWide %>%
+  group_by(plantName) %>%
+  summarize(countDAI = n_distinct(DAI)) # PII05 has a missing observation
+
+wavesARDWide <- wavesARDWide %>%
+  filter(plantName != "PII05")
+
+wavesARDWide <- wavesARDWide %>%
+mutate(SigInfBinned = cut(percentSigInfested, breaks = c(0,5,10,20,30,40,50,Inf), include.lowest = TRUE))
+
+startT <- Sys.time()
+multRM.Model1 <- multRM(cbind(`624`,`1051`,`1470`) ~  SigInfBinned + DAI, data = wavesARDWide, subject = "plantName", within = "DAI")
+endT <- Sys.time()
+endT- startT
+
+summary(multRM.Model1)
+```
+
+Binomial Logistic Regression
+```{r}
+# empirical logit for significant infestations
+#           log(infestation% / 1 - infestation%)
+
+# infestationData$SigInf.Logit <- log(infestationData$percentSigInfested + 1 / (1 - infestationData$percentSigInfested + 1))
+
+
+nrCumulative <- as.data.frame(rbind(nrDAI0,
+      nrDAI7,
+      nrDAI14,
+      nrDAI21,
+      nrDAI28,
+      nrDAI35,
+      nrDAI42,
+      nrDAI49,
+      nrDAI56)) %>%
+  select(-rowName)
+
+salientReflectance <- semi_join(refsLong,nrCumulative, by = c("DAI","wavelength"))
+
+compositeDataTheta5GLM <- salientReflectance %>%
+  inner_join(infestationData, by = "plantName") %>%
+  select(plantName,DAI,wavelength,reflectance,totalSignificantInfestations,totalStems)
+
+CDT5WideGLM <- compositeDataTheta5GLM %>%
+  unite("DAI_Wavelength", c("DAI","wavelength"), sep = "_") %>%
+  pivot_wider(names_from = DAI_Wavelength,
+              values_from = reflectance) %>%
+  na.omit()
+
+# remove plantName for modelling
+CDT5WideARDGLM <- CDT5WideGLM[,-1]
+names(CDT5WideARDGLM)
+
+names(CDT5WideARDGLM)[3:length(CDT5WideARDGLM)] <- paste0("x", names(CDT5WideARDGLM)[3:length(CDT5WideARDGLM)])
+
+# fit GLM
+glm1 <- glm(cbind(totalSignificantInfestations, totalStems - totalSignificantInfestations) ~ ., data  = CDT5WideARDGLM, family = "binomial")
+summary(glm1)
+
+
+plot(glm1$fitted.values,glm1$y, type = "p")
+
+par(mfrow = c(2,2))
+plot(glm1)
+
+# AIC (adj. r^2 = .7109, AIC = 359.58, BIC = 463.28, # covariates = 44)
+AICGLM <- step(glm1, direction = "backward", k = 2)
+deviance(AICGLM)/ 34 # 1.93 (*denominator is residual degrees of freedom -> call summary on model)
+glmtoolbox::adjR2(AICGLM) # .7109
+length(AICGLM$coefficients - 1) # 44
+
+# BIC (adj. r^2 = .6977, AIC = 362.66, BIC = 459.28, # covariates = 41)
+BICGLM <- step(glm1, direction = "backward", k = log(nrow(CDT5WideARDGLM)))
+deviance(BICGLM)/ 37 # 2.02
+glmtoolbox::adjR2(BICGLM) # .6977
+length(BICGLM$coefficients - 1) # 41
+
+par(mfrow = c(1,2))
+plot(AICGLM$fitted.values,AICGLM$y, type = "p", xlab = "Fitted", ylab = "Observed", main = "AIC backward selection GLM")
+plot(BICGLM$fitted.values,BICGLM$y, type = "p", xlab = "Fitted", ylab = "Observed", main = "BIC backward selection GLM")
+
+# BIC forward selection recommended by Manun & Paul 2023. https://www.mdpi.com/2073-8994/15/10/1905
+#   adj. r^2 = .5359, AIC = 383.92, BIC = 520.61, # covariates = 57
+BICGLMforward <- step(glm1, direction = "forward", k = log(nrow(CDT5WideARDGLM)))
+deviance(BICGLMforward)/ 20 # 3.1 !!!
+glmtoolbox::adjR2(BICGLMforward) # .5359
+length(BICGLMforward$coefficients) - 1 # 57
+# * compared to the other models this one is not good, it all choose all covariates....
+
+crPlots(BICGLM)
+
+```
+
+Generalized Linear Mixed-Effects Model
+```{r}
+
+library(lme4)
+
+salientReflectance <- semi_join(refsLong,nrCumulative, by = c("DAI","wavelength"))
+
+compositeDataTheta5GLMER <- salientReflectance %>%
+  inner_join(infestationData, by = "plantName") %>%
+  select(plantName,rep,DAI,wavelength,reflectance,totalSignificantInfestations,totalStems)
+
+CDT5WideGLMER <- compositeDataTheta5GLM %>%
+  unite("DAI_Wavelength", c("DAI","wavelength"), sep = "_") %>%
+  pivot_wider(names_from = DAI_Wavelength,
+              values_from = reflectance) %>%
+  na.omit()
+
+names(CDT5WideGLMER)[5:length(CDT5WideGLMER)] <- paste0("x", names(CDT5WideGLMER)[5:length(CDT5WideGLMER)])
+
+# make random effects factors for modeling
+CDT5WideGLMER$rep <- factor(CDT5WideGLMER$rep)
+CDT5WideGLMER$plantName <- factor(CDT5WideGLMER$plantName)
+
+# full GLMER
+glmer1 <- glmer(cbind(totalSignificantInfestations, totalStems - totalSignificantInfestations) ~
+    x0_613 + x0_704 + x0_707 + x0_1057 + x0_1477 + x0_1481 +
+        x0_1483 + x0_1488 + x0_1682 + x7_549 + x7_566 + x7_634 +
+        x7_703 + x7_706 + x7_709 + x7_1061 + x7_1404 + x7_1674 +
+        x14_612 + x14_628 + x14_710 + x14_714 + x14_1072 + x14_1667 +
+        x21_618 + x21_721 + x21_1073 + x21_1493 + x21_1671 +
+        x28_619 + x28_729 + x28_1062 + x28_1398 + x28_1458 +
+        x28_1513 + x28_1693 + x28_1814 + x35_620 + x35_727 +
+        x35_729 + x35_1046 + x35_1388 + x35_1476 + x35_1699 +
+        x42_615 + x42_624 + x42_628 + x42_717 + x42_1051 + x42_1391 +
+        x42_1470 + x42_1694 + x49_630 + x49_632 + x49_696 + x49_1285 +
+        x56_1195 + (1|rep) + (1|plantName), data  = CDT5WideGLMER, family = "binomial", na.action = na.omit, control=glmerControl(optCtrl=list(maxfun=20000)))
+glmer1Sum <- summary(glmer1)
+
+# model selection
+#  Can't use MuMIn::dredge because we have >37 covariates
+#  can't use stats::step because its not for GLMERs
+# can maybe use glmmLasso, couldn't get it to work earlier
+# is model selection needed?
+
+plot(fitted(glmer1), CDT5WideGLMER$totalSignificantInfestations/CDT5WideGLMER$totalStems)
+abline(0,1)
+
+# Likelihood Ratio Test for testing significance of fixed effects
+#   compare reduced models to full model removing 1 term at a time
+#   this tests to see if a term's coefficient is different than 0.
+#   call summary(glmer1) to find term with smallest coefficent and largest Z (x14_628)
+
+{
+glmer2 <- glmer(cbind(totalSignificantInfestations, totalStems - totalSignificantInfestations) ~
+    x0_613 + x0_704 + x0_707 + x0_1057 + x0_1477 + x0_1481 +
+        x0_1483 + x0_1488 + x0_1682 + x7_549 + x7_566 + x7_634 +
+        x7_703 + x7_706 + x7_709 + x7_1061 + x7_1404 + x7_1674 +
+        x14_612 + x14_710 + x14_714 + x14_1072 + x14_1667 +
+        x21_618 + x21_721 + x21_1073 + x21_1493 + x21_1671 +
+        x28_619 + x28_729 + x28_1062 + x28_1398 + x28_1458 +
+        x28_1513 + x28_1693 + x28_1814 + x35_620 + x35_727 +
+        x35_729 + x35_1046 + x35_1388 + x35_1476 + x35_1699 +
+        x42_615 + x42_624 + x42_628 + x42_717 + x42_1051 + x42_1391 +
+        x42_1470 + x42_1694 + x49_630 + x49_632 + x49_696 + x49_1285 +
+        x56_1195 + (1|rep) + (1|plantName), data  = CDT5WideGLMER, family = "binomial", na.action = na.omit, control=glmerControl(optCtrl=list(maxfun=20000)))
+
+# anova(glmer1,glmer2, test = "Chisq") # p .99 drop x14_628
+
+# x21_1073
+glmer3 <- glmer(cbind(totalSignificantInfestations, totalStems - totalSignificantInfestations) ~
+    x0_613 + x0_704 + x0_707 + x0_1057 + x0_1477 + x0_1481 +
+        x0_1483 + x0_1488 + x0_1682 + x7_549 + x7_566 + x7_634 +
+        x7_703 + x7_706 + x7_709 + x7_1061 + x7_1404 + x7_1674 +
+        x14_612 + x14_710 + x14_714 + x14_1072 + x14_1667 +
+        x21_618 + x21_721 + x21_1493 + x21_1671 +
+        x28_619 + x28_729 + x28_1062 + x28_1398 + x28_1458 +
+        x28_1513 + x28_1693 + x28_1814 + x35_620 + x35_727 +
+        x35_729 + x35_1046 + x35_1388 + x35_1476 + x35_1699 +
+        x42_615 + x42_624 + x42_628 + x42_717 + x42_1051 + x42_1391 +
+        x42_1470 + x42_1694 + x49_630 + x49_632 + x49_696 + x49_1285 +
+        x56_1195 + (1|rep) + (1|plantName), data  = CDT5WideGLMER, family = "binomial", na.action = na.omit, control=glmerControl(optCtrl=list(maxfun=20000)))
+
+# anova(glmer2,glmer3, test = "Chisq") # p .95 drop x21_1073
+
+# x14_612
+glmer4 <- glmer(cbind(totalSignificantInfestations, totalStems - totalSignificantInfestations) ~
+    x0_613 + x0_704 + x0_707 + x0_1057 + x0_1477 + x0_1481 +
+        x0_1483 + x0_1488 + x0_1682 + x7_549 + x7_566 + x7_634 +
+        x7_703 + x7_706 + x7_709 + x7_1061 + x7_1404 + x7_1674 +
+        x14_710 + x14_714 + x14_1072 + x14_1667 +
+        x21_618 + x21_721 + x21_1493 + x21_1671 +
+        x28_619 + x28_729 + x28_1062 + x28_1398 + x28_1458 +
+        x28_1513 + x28_1693 + x28_1814 + x35_620 + x35_727 +
+        x35_729 + x35_1046 + x35_1388 + x35_1476 + x35_1699 +
+        x42_615 + x42_624 + x42_628 + x42_717 + x42_1051 + x42_1391 +
+        x42_1470 + x42_1694 + x49_630 + x49_632 + x49_696 + x49_1285 +
+        x56_1195 + (1|rep) + (1|plantName), data  = CDT5WideGLMER, family = "binomial", na.action = na.omit, control=glmerControl(optCtrl=list(maxfun=20000)))
+
+# anova(glmer3,glmer4, test = "Chisq") # p .92 drop x14_612
+
+# x42_1051
+glmer5 <- glmer(cbind(totalSignificantInfestations, totalStems - totalSignificantInfestations) ~
+    x0_613 + x0_704 + x0_707 + x0_1057 + x0_1477 + x0_1481 +
+        x0_1483 + x0_1488 + x0_1682 + x7_549 + x7_566 + x7_634 +
+        x7_703 + x7_706 + x7_709 + x7_1061 + x7_1404 + x7_1674 +
+        x14_710 + x14_714 + x14_1072 + x14_1667 +
+        x21_618 + x21_721 + x21_1493 + x21_1671 +
+        x28_619 + x28_729 + x28_1062 + x28_1398 + x28_1458 +
+        x28_1513 + x28_1693 + x28_1814 + x35_620 + x35_727 +
+        x35_729 + x35_1046 + x35_1388 + x35_1476 + x35_1699 +
+        x42_615 + x42_624 + x42_628 + x42_717 + x42_1391 +
+        x42_1470 + x42_1694 + x49_630 + x49_632 + x49_696 + x49_1285 +
+        x56_1195 + (1|rep) + (1|plantName), data  = CDT5WideGLMER, family = "binomial", na.action = na.omit, control=glmerControl(optCtrl=list(maxfun=20000)))
+
+# anova(glmer4,glmer5, test = "Chisq") # p .90 drop x42_1051
+
+# x0_1483
+glmer6 <- glmer(cbind(totalSignificantInfestations, totalStems - totalSignificantInfestations) ~
+    x0_613 + x0_704 + x0_707 + x0_1057 + x0_1477 + x0_1481 +
+        x0_1488 + x0_1682 + x7_549 + x7_566 + x7_634 +
+        x7_703 + x7_706 + x7_709 + x7_1061 + x7_1404 + x7_1674 +
+        x14_710 + x14_714 + x14_1072 + x14_1667 +
+        x21_618 + x21_721 + x21_1493 + x21_1671 +
+        x28_619 + x28_729 + x28_1062 + x28_1398 + x28_1458 +
+        x28_1513 + x28_1693 + x28_1814 + x35_620 + x35_727 +
+        x35_729 + x35_1046 + x35_1388 + x35_1476 + x35_1699 +
+        x42_615 + x42_624 + x42_628 + x42_717 + x42_1391 +
+        x42_1470 + x42_1694 + x49_630 + x49_632 + x49_696 + x49_1285 +
+        x56_1195 + (1|rep) + (1|plantName), data  = CDT5WideGLMER, family = "binomial", na.action = na.omit, control=glmerControl(optCtrl=list(maxfun=20000)))
+
+# anova(glmer5,glmer6, test = "Chisq") # p .76 drop x0_1483
+
+# x35_1699
+glmer7 <- glmer(cbind(totalSignificantInfestations, totalStems - totalSignificantInfestations) ~
+    x0_613 + x0_704 + x0_707 + x0_1057 + x0_1477 + x0_1481 +
+        x0_1488 + x0_1682 + x7_549 + x7_566 + x7_634 +
+        x7_703 + x7_706 + x7_709 + x7_1061 + x7_1404 + x7_1674 +
+        x14_710 + x14_714 + x14_1072 + x14_1667 +
+        x21_618 + x21_721 + x21_1493 + x21_1671 +
+        x28_619 + x28_729 + x28_1062 + x28_1398 + x28_1458 +
+        x28_1513 + x28_1693 + x28_1814 + x35_620 + x35_727 +
+        x35_729 + x35_1046 + x35_1388 + x35_1476 +
+        x42_615 + x42_624 + x42_628 + x42_717 + x42_1391 +
+        x42_1470 + x42_1694 + x49_630 + x49_632 + x49_696 + x49_1285 +
+        x56_1195 + (1|rep) + (1|plantName), data  = CDT5WideGLMER, family = "binomial", na.action = na.omit, control=glmerControl(optCtrl=list(maxfun=20000)))
+
+# anova(glmer6,glmer7, test = "Chisq") # p .51 drop x35_1699
+
+# x35_1388
+glmer8 <- glmer(cbind(totalSignificantInfestations, totalStems - totalSignificantInfestations) ~
+    x0_613 + x0_704 + x0_707 + x0_1057 + x0_1477 + x0_1481 +
+        x0_1488 + x0_1682 + x7_549 + x7_566 + x7_634 +
+        x7_703 + x7_706 + x7_709 + x7_1061 + x7_1404 + x7_1674 +
+        x14_710 + x14_714 + x14_1072 + x14_1667 +
+        x21_618 + x21_721 + x21_1493 + x21_1671 +
+        x28_619 + x28_729 + x28_1062 + x28_1398 + x28_1458 +
+        x28_1513 + x28_1693 + x28_1814 + x35_620 + x35_727 +
+        x35_729 + x35_1046 + x35_1476 +
+        x42_615 + x42_624 + x42_628 + x42_717 + x42_1391 +
+        x42_1470 + x42_1694 + x49_630 + x49_632 + x49_696 + x49_1285 +
+        x56_1195 + (1|rep) + (1|plantName), data  = CDT5WideGLMER, family = "binomial", na.action = na.omit, control=glmerControl(optCtrl=list(maxfun=20000)))
+
+# anova(glmer7,glmer8, test = "Chisq") # .77 drop x35_1388
+
+# x42_628
+glmer9 <- glmer(cbind(totalSignificantInfestations, totalStems - totalSignificantInfestations) ~
+    x0_613 + x0_704 + x0_707 + x0_1057 + x0_1477 + x0_1481 +
+        x0_1488 + x0_1682 + x7_549 + x7_566 + x7_634 +
+        x7_703 + x7_706 + x7_709 + x7_1061 + x7_1404 + x7_1674 +
+        x14_710 + x14_714 + x14_1072 + x14_1667 +
+        x21_618 + x21_721 + x21_1493 + x21_1671 +
+        x28_619 + x28_729 + x28_1062 + x28_1398 + x28_1458 +
+        x28_1513 + x28_1693 + x28_1814 + x35_620 + x35_727 +
+        x35_729 + x35_1046 + x35_1476 +
+        x42_615 + x42_624 + x42_717 + x42_1391 +
+        x42_1470 + x42_1694 + x49_630 + x49_632 + x49_696 + x49_1285 +
+        x56_1195 + (1|rep) + (1|plantName), data  = CDT5WideGLMER, family = "binomial", na.action = na.omit, control=glmerControl(optCtrl=list(maxfun=20000)))
+
+# anova(glmer8,glmer9, test = "Chisq") # p .69 drop x42_628
+
+# x7_1061
+glmer10 <- glmer(cbind(totalSignificantInfestations, totalStems - totalSignificantInfestations) ~
+    x0_613 + x0_704 + x0_707 + x0_1057 + x0_1477 + x0_1481 +
+        x0_1488 + x0_1682 + x7_549 + x7_566 + x7_634 +
+        x7_703 + x7_706 + x7_709 + x7_1404 + x7_1674 +
+        x14_710 + x14_714 + x14_1072 + x14_1667 +
+        x21_618 + x21_721 + x21_1493 + x21_1671 +
+        x28_619 + x28_729 + x28_1062 + x28_1398 + x28_1458 +
+        x28_1513 + x28_1693 + x28_1814 + x35_620 + x35_727 +
+        x35_729 + x35_1046 + x35_1476 +
+        x42_615 + x42_624 + x42_717 + x42_1391 +
+        x42_1470 + x42_1694 + x49_630 + x49_632 + x49_696 + x49_1285 +
+        x56_1195 + (1|rep) + (1|plantName), data  = CDT5WideGLMER, family = "binomial", na.action = na.omit, control=glmerControl(optCtrl=list(maxfun=20000)))
+
+# anova(glmer9,glmer10, test = "Chisq") # p .41 drop x7_1061
+
+# x7_703
+glmer11 <- glmer(cbind(totalSignificantInfestations, totalStems - totalSignificantInfestations) ~
+    x0_613 + x0_704 + x0_707 + x0_1057 + x0_1477 + x0_1481 +
+        x0_1488 + x0_1682 + x7_549 + x7_566 + x7_634 +
+        x7_706 + x7_709 + x7_1404 + x7_1674 +
+        x14_710 + x14_714 + x14_1072 + x14_1667 +
+        x21_618 + x21_721 + x21_1493 + x21_1671 +
+        x28_619 + x28_729 + x28_1062 + x28_1398 + x28_1458 +
+        x28_1513 + x28_1693 + x28_1814 + x35_620 + x35_727 +
+        x35_729 + x35_1046 + x35_1476 +
+        x42_615 + x42_624 + x42_717 + x42_1391 +
+        x42_1470 + x42_1694 + x49_630 + x49_632 + x49_696 + x49_1285 +
+        x56_1195 + (1|rep) + (1|plantName), data  = CDT5WideGLMER, family = "binomial", na.action = na.omit, control=glmerControl(optCtrl=list(maxfun=20000)))
+
+# anova(glmer10,glmer11, test = "Chisq") # .63 drop x7_703
+
+# x42_624
+glmer12 <- glmer(cbind(totalSignificantInfestations, totalStems - totalSignificantInfestations) ~
+    x0_613 + x0_704 + x0_707 + x0_1057 + x0_1477 + x0_1481 +
+        x0_1488 + x0_1682 + x7_549 + x7_566 + x7_634 +
+        x7_706 + x7_709 + x7_1404 + x7_1674 +
+        x14_710 + x14_714 + x14_1072 + x14_1667 +
+        x21_618 + x21_721 + x21_1493 + x21_1671 +
+        x28_619 + x28_729 + x28_1062 + x28_1398 + x28_1458 +
+        x28_1513 + x28_1693 + x28_1814 + x35_620 + x35_727 +
+        x35_729 + x35_1046 + x35_1476 +
+        x42_615 + x42_717 + x42_1391 +
+        x42_1470 + x42_1694 + x49_630 + x49_632 + x49_696 + x49_1285 +
+        x56_1195 + (1|rep) + (1|plantName), data  = CDT5WideGLMER, family = "binomial", na.action = na.omit, control=glmerControl(optCtrl=list(maxfun=20000)))
+
+# anova(glmer11,glmer12, test = "Chisq") # p .46 drop x42_624
+
+# x7_566
+glmer13 <- glmer(cbind(totalSignificantInfestations, totalStems - totalSignificantInfestations) ~
+    x0_613 + x0_704 + x0_707 + x0_1057 + x0_1477 + x0_1481 +
+        x0_1488 + x0_1682 + x7_549 + x7_634 +
+        x7_706 + x7_709 + x7_1404 + x7_1674 +
+        x14_710 + x14_714 + x14_1072 + x14_1667 +
+        x21_618 + x21_721 + x21_1493 + x21_1671 +
+        x28_619 + x28_729 + x28_1062 + x28_1398 + x28_1458 +
+        x28_1513 + x28_1693 + x28_1814 + x35_620 + x35_727 +
+        x35_729 + x35_1046 + x35_1476 +
+        x42_615 + x42_717 + x42_1391 +
+        x42_1470 + x42_1694 + x49_630 + x49_632 + x49_696 + x49_1285 +
+        x56_1195 + (1|rep) + (1|plantName), data  = CDT5WideGLMER, family = "binomial", na.action = na.omit, control=glmerControl(optCtrl=list(maxfun=20000)))
+
+# anova(glmer12,glmer13, test = "Chisq") # .49 drop x7_566
+
+# x49_696
+glmer14 <- glmer(cbind(totalSignificantInfestations, totalStems - totalSignificantInfestations) ~
+    x0_613 + x0_704 + x0_707 + x0_1057 + x0_1477 + x0_1481 +
+        x0_1488 + x0_1682 + x7_549 + x7_634 +
+        x7_706 + x7_709 + x7_1404 + x7_1674 +
+        x14_710 + x14_714 + x14_1072 + x14_1667 +
+        x21_618 + x21_721 + x21_1493 + x21_1671 +
+        x28_619 + x28_729 + x28_1062 + x28_1398 + x28_1458 +
+        x28_1513 + x28_1693 + x28_1814 + x35_620 + x35_727 +
+        x35_729 + x35_1046 + x35_1476 +
+        x42_615 + x42_717 + x42_1391 +
+        x42_1470 + x42_1694 + x49_630 + x49_632 + x49_1285 +
+        x56_1195 + (1|rep) + (1|plantName), data  = CDT5WideGLMER, family = "binomial", na.action = na.omit, control=glmerControl(optCtrl=list(maxfun=20000)))
+
+# anova(glmer13,glmer14, test = "Chisq") # .50 drop x49_696
+
+# x28_1398
+glmer15 <- glmer(cbind(totalSignificantInfestations, totalStems - totalSignificantInfestations) ~
+    x0_613 + x0_704 + x0_707 + x0_1057 + x0_1477 + x0_1481 +
+        x0_1488 + x0_1682 + x7_549 + x7_634 +
+        x7_706 + x7_709 + x7_1404 + x7_1674 +
+        x14_710 + x14_714 + x14_1072 + x14_1667 +
+        x21_618 + x21_721 + x21_1493 + x21_1671 +
+        x28_619 + x28_729 + x28_1062 + x28_1458 +
+        x28_1513 + x28_1693 + x28_1814 + x35_620 + x35_727 +
+        x35_729 + x35_1046 + x35_1476 +
+        x42_615 + x42_717 + x42_1391 +
+        x42_1470 + x42_1694 + x49_630 + x49_632 + x49_1285 +
+        x56_1195 + (1|rep) + (1|plantName), data  = CDT5WideGLMER, family = "binomial", na.action = na.omit, control=glmerControl(optCtrl=list(maxfun=20000)))
+
+# anova(glmer14,glmer15, test = "Chisq") # .44 drop x28_1398
+
+# x28_1062
+glmer16 <- glmer(cbind(totalSignificantInfestations, totalStems - totalSignificantInfestations) ~
+    x0_613 + x0_704 + x0_707 + x0_1057 + x0_1477 + x0_1481 +
+        x0_1488 + x0_1682 + x7_549 + x7_634 +
+        x7_706 + x7_709 + x7_1404 + x7_1674 +
+        x14_710 + x14_714 + x14_1072 + x14_1667 +
+        x21_618 + x21_721 + x21_1493 + x21_1671 +
+        x28_619 + x28_729 + x28_1458 +
+        x28_1513 + x28_1693 + x28_1814 + x35_620 + x35_727 +
+        x35_729 + x35_1046 + x35_1476 +
+        x42_615 + x42_717 + x42_1391 +
+        x42_1470 + x42_1694 + x49_630 + x49_632 + x49_1285 +
+        x56_1195 + (1|rep) + (1|plantName), data  = CDT5WideGLMER, family = "binomial", na.action = na.omit, control=glmerControl(optCtrl=list(maxfun=20000)))
+
+# anova(glmer15,glmer16, test = "Chisq") # .15 drop x28_1062
+
+# x0_1477
+glmer17 <- glmer(cbind(totalSignificantInfestations, totalStems - totalSignificantInfestations) ~
+    x0_613 + x0_704 + x0_707 + x0_1057 + x0_1481 +
+        x0_1488 + x0_1682 + x7_549 + x7_634 +
+        x7_706 + x7_709 + x7_1404 + x7_1674 +
+        x14_710 + x14_714 + x14_1072 + x14_1667 +
+        x21_618 + x21_721 + x21_1493 + x21_1671 +
+        x28_619 + x28_729 + x28_1458 +
+        x28_1513 + x28_1693 + x28_1814 + x35_620 + x35_727 +
+        x35_729 + x35_1046 + x35_1476 +
+        x42_615 + x42_717 + x42_1391 +
+        x42_1470 + x42_1694 + x49_630 + x49_632 + x49_1285 +
+        x56_1195 + (1|rep) + (1|plantName), data  = CDT5WideGLMER, family = "binomial", na.action = na.omit, control=glmerControl(optCtrl=list(maxfun=20000)))
+
+# anova(glmer16,glmer17, test = "Chisq") # .09 drop x0_1477
+
+# x42_1694
+glmer18 <- glmer(cbind(totalSignificantInfestations, totalStems - totalSignificantInfestations) ~
+    x0_613 + x0_704 + x0_707 + x0_1057 + x0_1481 +
+        x0_1488 + x0_1682 + x7_549 + x7_634 +
+        x7_706 + x7_709 + x7_1404 + x7_1674 +
+        x14_710 + x14_714 + x14_1072 + x14_1667 +
+        x21_618 + x21_721 + x21_1493 + x21_1671 +
+        x28_619 + x28_729 + x28_1458 +
+        x28_1513 + x28_1693 + x28_1814 + x35_620 + x35_727 +
+        x35_729 + x35_1046 + x35_1476 +
+        x42_615 + x42_717 + x42_1391 +
+        x42_1470 + x49_630 + x49_632 + x49_1285 +
+        x56_1195 + (1|rep) + (1|plantName), data  = CDT5WideGLMER, family = "binomial", na.action = na.omit, control=glmerControl(optCtrl=list(maxfun=20000)))
+
+# anova(glmer17,glmer18, test = "Chisq") # .03 keep x42_1694
+
+}
+
+# final model of fixed effects
+finalGLMER <- glmer17
+
+plot(fitted(finalGLMER ), CDT5WideGLMER$totalSignificantInfestations/CDT5WideGLMER$totalStems, xlab = "fitted", ylab = "actual", main = "GLM Actual vs. Predicted")
+abline(0,1, col = "red")
+
+# test for significance of random effects
+# remove plantName
+REglmer1 <- glmer(cbind(totalSignificantInfestations, totalStems - totalSignificantInfestations) ~
+    x0_613 + x0_704 + x0_707 + x0_1057 + x0_1481 +
+        x0_1488 + x0_1682 + x7_549 + x7_634 +
+        x7_706 + x7_709 + x7_1404 + x7_1674 +
+        x14_710 + x14_714 + x14_1072 + x14_1667 +
+        x21_618 + x21_721 + x21_1493 + x21_1671 +
+        x28_619 + x28_729 + x28_1458 +
+        x28_1513 + x28_1693 + x28_1814 + x35_620 + x35_727 +
+        x35_729 + x35_1046 + x35_1476 +
+        x42_615 + x42_717 + x42_1391 +
+        x42_1470 + x42_1694 + x49_630 + x49_632 + x49_1285 +
+        x56_1195 + (1|rep), data  = CDT5WideGLMER, family = "binomial", na.action = na.omit, control=glmerControl(optCtrl=list(maxfun=20000)))
+
+# anova(finalGLMER,REglmer1, test = "Chisq") # p 1, no significance
+
+# rep
+REglmer2 <- glmer(cbind(totalSignificantInfestations, totalStems - totalSignificantInfestations) ~
+    x0_613 + x0_704 + x0_707 + x0_1057 + x0_1481 +
+        x0_1488 + x0_1682 + x7_549 + x7_634 +
+        x7_706 + x7_709 + x7_1404 + x7_1674 +
+        x14_710 + x14_714 + x14_1072 + x14_1667 +
+        x21_618 + x21_721 + x21_1493 + x21_1671 +
+        x28_619 + x28_729 + x28_1458 +
+        x28_1513 + x28_1693 + x28_1814 + x35_620 + x35_727 +
+        x35_729 + x35_1046 + x35_1476 +
+        x42_615 + x42_717 + x42_1391 +
+        x42_1470 + x42_1694 + x49_630 + x49_632 + x49_1285 +
+        x56_1195 + (1|plantName), data  = CDT5WideGLMER, family = "binomial", na.action = na.omit, control=glmerControl(optCtrl=list(maxfun=20000)))
+
+# anova(finalGLMER, REglmer2, test = "Chisq") # p 1, no significance
+
+# leads us to believe random effects can be dropped, fit GLM so we can see diagnostics that GLMER won't show us.
+
+```
+
+fit glm with final model to look at model diagnostics
+```{r}
+# fit GLM
+finalGLM <- glm(cbind(totalSignificantInfestations, totalStems - totalSignificantInfestations) ~
+    x0_613 + x0_704 + x0_707 + x0_1057 + x0_1481 +
+        x0_1488 + x0_1682 + x7_549 + x7_634 +
+        x7_706 + x7_709 + x7_1404 + x7_1674 +
+        x14_710 + x14_714 + x14_1072 + x14_1667 +
+        x21_618 + x21_721 + x21_1493 + x21_1671 +
+        x28_619 + x28_729 + x28_1458 +
+        x28_1513 + x28_1693 + x28_1814 + x35_620 + x35_727 +
+        x35_729 + x35_1046 + x35_1476 +
+        x42_615 + x42_717 + x42_1391 +
+        x42_1470 + x42_1694 + x49_630 + x49_632 + x49_1285 +
+        x56_1195, data  = CDT5WideARDGLM, family = "binomial")
+summary(finalGLM)
+
+
+plot(finalGLM$fitted.values,finalGLM$y, type = "p")
+
+par(mfrow = c(2,2))
+plot(finalGLM)
+
+crPlots(finalGLM, ylab  = "Logit Significant Infestation %")
+
+plot(effects::allEffects(finalGLM, residuals = T), grid = T, type = "response")
+```
+
+
+```{r glmmLasso attempts}
+library(glmmLasso)
+
+# Define the fixed effects formula
+fixed_formula <- cbind(totalSignificantInfestations, totalStems - totalSignificantInfestations) ~
+  x0_613 + x0_704 + x0_707 + x0_1057 + x0_1477 + x0_1481 +
+  x0_1483 + x0_1488 + x0_1682 + x7_549 + x7_566 + x7_634 +
+  x7_703 + x7_706 + x7_709 + x7_1061 + x7_1404 + x7_1674 +
+  x14_612 + x14_628 + x14_710 + x14_714 + x14_1072 + x14_1667 +
+  x21_618 + x21_721 + x21_1073 + x21_1493 + x21_1671 +
+  x28_619 + x28_729 + x28_1062 + x28_1398 + x28_1458 +
+  x28_1513 + x28_1693 + x28_1814 + x35_620 + x35_727 +
+  x35_729 + x35_1046 + x35_1388 + x35_1476 + x35_1699 +
+  x42_615 + x42_624 + x42_628 + x42_717 + x42_1051 + x42_1391 +
+  x42_1470 + x42_1694 + x49_630 + x49_632 + x49_696 + x49_1285 +
+  x56_1195
+
+# Fit the glmmLasso model
+glmerLasso <- glmmLasso(fix = fixed_formula,
+                   rnd = list(rep = ~1, plantName = ~1),
+                   data = CDT5WideGLMER,
+                   family = binomial())
+```
+
+```{r}
+# Example data for illustration
+set.seed(123)
+
+# Simulated reflectance measurements for 3 subjects, 5 time points, and 20 wavelengths
+n_subjects <- 3
+n_time_points <- 5
+n_wavelengths <- 20
+
+# Simulated reflectance measurements
+reflectance_data <- matrix(rnorm(n_subjects * n_time_points * n_wavelengths, mean = 0.5, sd = 0.1),
+                           ncol = n_wavelengths, byrow = TRUE)
+
+# Simulated time and infestation percent variables
+time <- rep(1:n_time_points, each = n_subjects)
+infestation_percent <- rep(c(10, 20, 30), times = n_time_points)
+
+# Simulated subject IDs
+subject_id <- rep(1:n_subjects, each = n_time_points)
+
+# Combine reflectance measurements into a matrix
+reflectance_matrix <- reflectance_data
+
+# Create design matrix
+design_matrix <- cbind(time, infestation_percent)
+
+# Fit the multivariate repeated measures model
+result <- multRM(data = list(y = reflectance_matrix, design = design_matrix), within = design_matrix, subject = subject_id)
+
+# Print the results
+summary(result)
+```
+
+```{r}
+data(EEG)
+library(tidyr)
+eeg <- spread(EEG, feature, resp)
+fit <- multRM(cbind(brainrate, complexity) ~ sex * region, data = eeg,
+              subject = "id", within = "region")
+summary(fit)
+```
+
+feature selection with Random Forest
+```{r}
+library(caret)
+nrCumulative <- as.data.frame(rbind(nrDAI0,
+      nrDAI7,
+      nrDAI14,
+      nrDAI21,
+      nrDAI28,
+      nrDAI35,
+      nrDAI42,
+      nrDAI49,
+      nrDAI56)) %>%
+  select(-rowName)
+
+salientReflectance <- semi_join(refsLong,nrCumulative, by = c("DAI","wavelength"))
+
+compositeDataTheta5 <- salientReflectance %>%
+  inner_join(infestationData, by = "plantName") %>%
+  select(plantName,DAI,wavelength,reflectance,percentSigInfested)
+
+CDT5Wide <- compositeDataTheta5 %>%
+  unite("DAI_Wavelength", c("DAI","wavelength"), sep = "_") %>%
+  pivot_wider(names_from = DAI_Wavelength,
+              values_from = reflectance) %>%
+  na.omit() # yikes
+# remove plantName for modelling
+CDT5WideARD <- CDT5Wide[,-1] %>% na.omit() # remove NA's b/c modelling will do this anyway
+rm(results)
+# define the control using a random forest selection function
+control <- rfeControl(functions=rfFuncs, method="cv", number=10)
+# run the RFE algorithm
+results <- caret::rfe(CDT5WideARD[,2:58], as.matrix(CDT5WideARD[,1]), sizes=c(1:length(CDT5WideARD[,2:58])), rfeControl = control)
+
+print(results)
+
+plot(results$fit$predicted, CDT5Wide$percentSigInfested, main = "Random Forest Selected - Fitted to Linear Model, Predicted V. Actual", xlab = "Predicted", ylab = "Actual")
+abline(1,1)
+
+# plot the results
+plot(results, type=c("g","o"))
+
+# random forest selected covariates
+RFSelection <-  CDT5Wide %>% select(percentSigInfested,row.names(results$fit$importance))
+
+lmRF <- lm(percentSigInfested~., data = RFSelection)
+summary(lmRF)
+AnovaTableRF <- Anova(lmRF)
+sortedAnovaTableRF <- AnovaTableRF[order(AnovaTableRF$"Pr(>F)"), ]
+AIC(lmRF)
+plot(lmRF$fitted.values,RFSelection$percentSigInfested, main = "Random Forest Selected - Fitted to Linear Model, Predicted V. Actual", xlab = "Predicted", ylab = "Actual")
+abline(1,1)
+# library(Boruta)
+#
+# Boruta(percentSigInfested ~.,data = CDT5WideARD, doTrace = 3, mcAdj = T)
+#
+# library(randomForest)
+
+
+```
+
+```{r}
+# Sample dataframe
+df <- data.frame("0_1470" = 1:5, "14_620" = 6:10)
+
+# Define mapping between numbers and letters
+mapping <- c("A", "B", "C", "D", "E", "F", "G", "H", "I")
+
+# Get column names of the dataframe
+col_names <- names(df)
+
+# Extract the numbers before "_" in the column names
+numbers <- gsub(".*?_", "", col_names)
+
+# Convert the numbers to numeric and map them to letters
+letters <- mapping[as.numeric(numbers) %/% 7 + 1]
+
+# Replace the numbers in the column names with letters
+new_col_names <- gsub("^.*?_", "", col_names)
+new_col_names <- paste0(letters, "_", new_col_names)
+
+# Rename the columns
+names(df) <- new_col_names
+
+# Check the updated dataframe
+print(df)
+colnames(df)
+```
+
+
+Repeated Measures
+```{r}
+# Load the lme4 package
+library(lme4)
+
+# Create a hypothetical dataset
+set.seed(123)
+n <- 100 # Number of individuals
+time_points <- 4 # Number of time points
+time <- rep(1:time_points, each = n)
+id <- rep(1:n, times = time_points)
+y <- rnorm(n * time_points) # Response variable
+data <- data.frame(id = id, time = time, y = y)
+
+# Fit the repeated measures mixed model
+model <- lmer(y ~ time + (1 | id), data = data)
+
+# Get the degrees of freedom
+summary(model)
+
+```
+
+IBRA over time
+```{r}
+library(plotly)
+
+CompositeIBRA <- rbind(I0 = clustersS_OG_0_5 %>%
+   mutate(wavelength = 520:1870) %>%
+   mutate(DAI = rep(0, times = length(520:1870))),
+ I7 = clustersS_OG_7_5 %>%
+   mutate(wavelength = 520:1870) %>%
+   mutate(DAI = rep(7, times = length(520:1870))),
+ I14 <- clustersS_OG_14_5 %>%
+   mutate(wavelength = 520:1870) %>%
+   mutate(DAI = rep(14, times = length(520:1870))),
+ I21 <- clustersS_OG_21_5 %>%
+   mutate(wavelength = 520:1870) %>%
+   mutate(DAI = rep(21, times = length(520:1870))),
+ I28 <- clustersS_OG_28_5 %>%
+   mutate(wavelength = 520:1870) %>%
+   mutate(DAI = rep(28, times = length(520:1870))),
+ I35 <- clustersS_OG_35_5 %>%
+   mutate(wavelength = 520:1870) %>%
+   mutate(DAI = rep(35, times = length(520:1870))),
+ I42 <- clustersS_OG_42_5 %>%
+   mutate(wavelength = 520:1870) %>%
+   mutate(DAI = rep(42, times = length(520:1870))),
+ I49 <- clustersS_OG_49_5 %>%
+   mutate(wavelength = 520:1870) %>%
+   mutate(DAI = rep(49, times = length(520:1870))),
+ I56 <- clustersS_OG_56_5 %>%
+   mutate(wavelength = 520:1870) %>%
+   mutate(DAI = rep(56, times = length(520:1870))))
+CompositeIBRA$DAI <- as.integer(CompositeIBRA$DAI)
+CompositeIBRA$wavelength <- as.numeric(CompositeIBRA$wavelength)
+CompositeIBRA$reflectance <- as.numeric(CompositeIBRA$VIF)
+
+SelectedWavesP <- nrCumulative %>%
+  mutate(reflectance = as.numeric(0.41)) %>%
+  mutate(wavelength = as.numeric(wavelength)) %>%
+  mutate(DAI = as.integer(DAI))
+
+SpecMuByDAI <- refs %>%
+  group_by(DAI) %>%
+  dplyr::select(`520`:`1870`) %>%
+   summarize(across(everything(),list(mean)))
+# Rename Wavelengths
+names(SpecMuByDAI)[1:1352] <- c("DAI",c(520:1870))
+
+# create 3d plotting df
+ spec3d<- list(as.matrix(SpecMuByDAI[,2:1352]), #z
+               as.numeric(colnames(SpecMuByDAI[2:1352])), #x
+               c(unique(SpecMuByDAI[,1]))) %>% #y
+                set_names(c("z","x","y"))
+row.names(spec3d$z) <- c(sort(SpecMuByDAI$DAI))
+
+ color_scale <- list(c(min(as.integer(row.names(spec3d$z))), "blue"), c(max(as.integer(row.names(spec3d$z))), "yellow"))
+
+p <- plot_ly(
+   z = ~ spec3d$z,
+   x = ~ spec3d$x,
+   y = ~ as.integer(row.names(spec3d$z)),
+   colors = c("darkgreen","greenyellow","yellow","orange"),
+   type = "surface",
+   colorbar = c(0.1,.4),
+ cmin = 0,cmax = .6) %>% layout(scene = list(
+   camera = list(eye = list(x = 1.5, y = -1.7, z = .75)),
+   xaxis = list(title = "Wavelength", range = range(520:1870)),
+   yaxis = list(title = "Days After Infestation", range = range(spec3d$y)),
+   zaxis = list(title = "Reflectance", range = c(0,.6)),
+               colorbar = list(title = "reflectance", cmin = .2, cmax = .6)))
+
+pt <- add_trace(p, data = SelectedWavesP, x = ~wavelength, y = ~DAI, z = ~reflectance, type = "scatter3d", mode = "markers", marker = list(color = "red", size = 1, symbol = "x"))
+pt
+
+plot_ly( data = SelectedWavesP, x = ~wavelength, y = ~DAI, Z = ~reflectance, type = "scatter3d", mode = "markers", marker = list(color = "red", size = 20, symbol = "x"))
+
+# add main data
+p <- plot_ly(data = CompositeIBRA, x = ~wavelength, y = ~DAI, z = ~VIF, type = "scatter3d",marker = list(color = "steelblue", size = 1))
+# add trace
+p <- add_trace(p, data = nrCumulative, x = ~wavelength, y = ~DAI, Z = ~VIF, type = "scatter3d", marker = list(color = "red", size = 2, symbol = "x"))
+# add layout elements
+p <- layout(p, scene = list(zaxis = list(range = c(0, 1000))))
+p
+```
+
+plot IBRA at each time step
+0
+```{r}
+plotter_OG_0_5 <- clustersS_OG_0_5 %>%
+  mutate(wavelength = as.numeric(520:1870)) %>%
+  mutate(reflectance = as.numeric(refs %>%
+        filter(DAI == 0) %>%
+        dplyr::select(`520`:`1870`) %>%
+        summarize(across(everything(), list(mean)))))
+
+vifMinima_OG_0_5 <- plotter_OG_0_5 %>%
+  filter(clusters < 5)
+
+ggplot(plotter_OG_0_5, aes(x=wavelength)) +
+  geom_line(aes(y=(reflectance)*2200)) +
+  geom_line(aes(y=plotter_OG_0_5$clusters)) + scale_y_continuous(
+    name = "VIF", limits = c(0,900),
+    sec.axis = sec_axis(~./2200, name="Reflectance"))  + geom_line(
+    mapping = aes(y = reflectance*2200),
+    data = plotter_OG_0_5, colour = 'darkgreen',
+    size = 1.25) + ggtitle("IBRA VIF Values, DAI = 0") + geom_point(mapping = aes(x = wavelength, y =clusters ), data = , colour = "red", pch = 4) + theme_bw()
+
+```
+
+7
+```{r}
+plotter_OG_7_5 <- clustersS_OG_7_5 %>%
+  mutate(wavelength = as.numeric(520:1870)) %>%
+  mutate(reflectance = as.numeric(refs %>%
+        filter(DAI == 7) %>%
+        dplyr::select(`520`:`1870`) %>%
+        summarize(across(everything(), list(mean)))))
+
+vifMinima_OG_7_5 <- plotter_OG_7_5 %>%
+  filter(clusters < 5)
+
+ggplot(plotter_OG_7_5, aes(x=wavelength)) +
+  geom_line(aes(y=(reflectance)*2200)) +
+  geom_line(aes(y=plotter_OG_7_5$clusters)) + scale_y_continuous(
+    name = "VIF", limits = c(0,900),
+    sec.axis = sec_axis(~./2200, name="Reflectance"))  + geom_line(
+    mapping = aes(y = reflectance*2200),
+    data = plotter_OG_7_5, colour = 'darkgreen',
+    size = 1.25) + ggtitle("IBRA VIF Values, DAI = 7") + geom_point(mapping = aes(x = wavelength, y =clusters ), data = vifMinima_OG_7_5, colour = "red", pch = 4) + theme_bw()
+
+```
+
+14
+```{r}
+plotter_OG_14_5 <- clustersS_OG_14_5 %>%
+  mutate(wavelength = as.numeric(520:1870)) %>%
+  mutate(reflectance = as.numeric(refs %>%
+        filter(DAI == 14) %>%
+        dplyr::select(`520`:`1870`) %>%
+        summarize(across(everything(), list(mean)))))
+
+vifMinima_OG_14_5 <- plotter_OG_14_5 %>%
+  filter(clusters < 5)
+
+ggplot(plotter_OG_14_5, aes(x=wavelength)) +
+  geom_line(aes(y=(reflectance)*2200)) +
+  geom_line(aes(y=plotter_OG_14_5$clusters)) + scale_y_continuous(
+    name = "VIF", limits = c(0,900),
+    sec.axis = sec_axis(~./2200, name="Reflectance"))  + geom_line(
+    mapping = aes(y = reflectance*2200),
+    data = plotter_OG_14_5, colour = 'darkgreen',
+    size = 1.25) + ggtitle("IBRA VIF Values, DAI = 14") + geom_point(mapping = aes(x = wavelength, y =clusters ), data = vifMinima_OG_14_5, colour = "red", pch = 4) + theme_bw()
+
+```
+
+21
+```{r}
+plotter_OG_21_5 <- clustersS_OG_21_5 %>%
+  mutate(wavelength = as.numeric(520:1870)) %>%
+  mutate(reflectance = as.numeric(refs %>%
+        filter(DAI == 21) %>%
+        dplyr::select(`520`:`1870`) %>%
+        summarize(across(everything(), list(mean)))))
+
+vifMinima_OG_21_5 <- plotter_OG_21_5 %>%
+  filter(clusters < 5)
+
+ggplot(plotter_OG_21_5, aes(x=wavelength)) +
+  geom_line(aes(y=(reflectance)*2200)) +
+  geom_line(aes(y=plotter_OG_21_5$clusters)) + scale_y_continuous(
+    name = "VIF", limits = c(0,900),
+    sec.axis = sec_axis(~./2200, name="Reflectance"))  + geom_line(
+    mapping = aes(y = reflectance*2200),
+    data = plotter_OG_21_5, colour = 'darkgreen',
+    size = 1.25) + ggtitle("IBRA VIF Values, DAI = 21") + geom_point(mapping = aes(x = wavelength, y =clusters ), data = vifMinima_OG_21_5, colour = "red", pch = 4) + theme_bw()
+```
+
+28
+```{r}
+plotter_OG_28_5 <- clustersS_OG_28_5 %>%
+  mutate(wavelength = as.numeric(520:1870)) %>%
+  mutate(reflectance = as.numeric(refs %>%
+        filter(DAI == 28) %>%
+        dplyr::select(`520`:`1870`) %>%
+        summarize(across(everything(), list(mean)))))
+
+vifMinima_OG_28_5 <- plotter_OG_28_5 %>%
+  filter(clusters < 5)
+
+ggplot(plotter_OG_28_5, aes(x=wavelength)) +
+  geom_line(aes(y=(reflectance)*2200)) +
+  geom_line(aes(y=plotter_OG_21_5$clusters)) + scale_y_continuous(
+    name = "VIF", limits = c(0,900),
+    sec.axis = sec_axis(~./2200, name="Reflectance"))  + geom_line(
+    mapping = aes(y = reflectance*2200),
+    data = plotter_OG_28_5, colour = 'darkgreen',
+    size = 1.25) + ggtitle("IBRA VIF Values, DAI = 28") + geom_point(mapping = aes(x = wavelength, y =clusters ), data = vifMinima_OG_28_5, colour = "red", pch = 4) + theme_bw()
+```
+
+35
+```{r}
+plotter_OG_35_5 <- clustersS_OG_35_5 %>%
+  mutate(wavelength = as.numeric(520:1870)) %>%
+  mutate(reflectance = as.numeric(refs %>%
+        filter(DAI == 35) %>%
+        dplyr::select(`520`:`1870`) %>%
+        summarize(across(everything(), list(mean)))))
+
+vifMinima_OG_35_5 <- plotter_OG_35_5 %>%
+  filter(clusters < 5)
+
+ggplot(plotter_OG_35_5, aes(x=wavelength)) +
+  geom_line(aes(y=(reflectance)*2200)) +
+  geom_line(aes(y=plotter_OG_35_5$clusters)) + scale_y_continuous(
+    name = "VIF", limits = c(0,900),
+    sec.axis = sec_axis(~./2200, name="Reflectance"))  + geom_line(
+    mapping = aes(y = reflectance*2200),
+    data = plotter_OG_35_5, colour = 'darkgreen',
+    size = 1.25) + ggtitle("IBRA VIF Values, DAI = 35") + geom_point(mapping = aes(x = wavelength, y =clusters ), data = vifMinima_OG_35_5, colour = "red", pch = 4) + theme_bw()
+```
+
+42
+```{r}
+plotter_OG_42_5 <- clustersS_OG_42_5 %>%
+  mutate(wavelength = as.numeric(520:1870)) %>%
+  mutate(reflectance = as.numeric(refs %>%
+        filter(DAI == 42) %>%
+        dplyr::select(`520`:`1870`) %>%
+        summarize(across(everything(), list(mean)))))
+
+vifMinima_OG_42_5 <- plotter_OG_42_5 %>%
+  filter(clusters < 5)
+
+ggplot(plotter_OG_42_5, aes(x=wavelength)) +
+  geom_line(aes(y=(reflectance)*2200)) +
+  geom_line(aes(y=plotter_OG_42_5$clusters)) + scale_y_continuous(
+    name = "VIF", limits = c(0,900),
+    sec.axis = sec_axis(~./2200, name="Reflectance"))  + geom_line(
+    mapping = aes(y = reflectance*2200),
+    data = plotter_OG_42_5, colour = 'darkgreen',
+    size = 1.25) + ggtitle("IBRA VIF Values, DAI = 42") + geom_point(mapping = aes(x = wavelength, y =clusters ), data = vifMinima_OG_42_5, colour = "red", pch = 4) + theme_bw()
+```
+
+49
+```{r}
+plotter_OG_49_5 <- clustersS_OG_49_5 %>%
+  mutate(wavelength = as.numeric(520:1870)) %>%
+  mutate(reflectance = as.numeric(refs %>%
+        filter(DAI == 49) %>%
+        dplyr::select(`520`:`1870`) %>%
+        summarize(across(everything(), list(mean)))))
+
+vifMinima_OG_49_5 <- plotter_OG_49_5 %>%
+  filter(clusters < 5)
+
+ggplot(plotter_OG_49_5, aes(x=wavelength)) +
+  geom_line(aes(y=(reflectance)*2200)) +
+  geom_line(aes(y=plotter_OG_49_5$clusters)) + scale_y_continuous(
+    name = "VIF", limits = c(0,900),
+    sec.axis = sec_axis(~./2200, name="Reflectance"))  + geom_line(
+    mapping = aes(y = reflectance*2200),
+    data = plotter_OG_49_5, colour = 'darkgreen',
+    size = 1.25) + ggtitle("IBRA VIF Values, DAI = 35") + geom_point(mapping = aes(x = wavelength, y =clusters ), data = vifMinima_OG_49_5, colour = "red", pch = 4) + theme_bw()
+```
+
+56
+```{r}
+plotter_OG_56_5 <- clustersS_OG_56_5 %>%
+  mutate(wavelength = as.numeric(520:1870)) %>%
+  mutate(reflectance = as.numeric(refs %>%
+        filter(DAI == 56) %>%
+        dplyr::select(`520`:`1870`) %>%
+        summarize(across(everything(), list(mean)))))
+
+vifMinima_OG_56_5 <- plotter_OG_56_5 %>%
+  filter(clusters < 5)
+
+ggplot(plotter_OG_56_5, aes(x=wavelength)) +
+  geom_line(aes(y=(reflectance)*800)) +
+  geom_line(aes(y=(plotter_OG_56_5$clusters)/5)) + scale_y_continuous(
+    name = "VIF", limits = c(0,375),
+    sec.axis = sec_axis(~./800, name="Reflectance"))  + geom_line(
+    mapping = aes(y = reflectance*800),
+    data = plotter_OG_56_5, colour = 'darkgreen',
+    size = 1.25) + ggtitle("IBRA VIF Values, DAI = 56") + geom_point(mapping = aes(x = wavelength, y =clusters ), data = vifMinima_OG_56_5, colour = "red", pch = 4, size = 4) + theme_bw()
+```
+
+
